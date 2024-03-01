@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Subnets:
+    Description: "subnets for fargate service"
+    Type: String
+    Default: '"subnet-01b63ea8d55565383","subnet-0b77b5786c4257dcb"'
+
+Resources:
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: AccessAurora
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:*
+                  - secretsmanager:*
+                Resource: "*"
+        - PolicyName: AccessKms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:*
+                Resource: !ImportValue formation-data-eng-AuroraKmsSecretArn
+        - PolicyName: AccessS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: "*"
+
+  MyEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ingestion-data
+
+  MyFargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: MyFargateCluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  MyFargateTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      Cpu: 0.25 vcpu
+      Memory: 1 GB
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: ingestion
+          Cpu: 256
+          Memory: 1024
+          Image: !Sub "${MyEcrRepository.RepositoryUri}:latest"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/ingestion
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: BUCKET_NAME
+              Value: !ImportValue formation-data-eng-BucketName
+            - Name: DB_SECRET
+              Value: !ImportValue formation-data-eng-AuroraSecret
+            - Name: DB_ENDPOINT
+              Value: !ImportValue formation-data-eng-AuroraHost
+            - Name: DB_NAME
+              Value: !Sub DbName
+            - Name: DB_PORT
+              Value: !ImportValue formation-data-eng-AuroraPort
+
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ingestion
+      RetentionInDays: 3
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsFargatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - iam:PassRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:CreateStateMachine
+                  - states:DeleteStateMachine
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  MyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "StartAt": "TriggerFargateTask",
+            "States": {
+              "TriggerFargateTask": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::ecs:runTask.sync",
+                "Parameters": {
+                  "LaunchType": "FARGATE",
+                  "Cluster": "${MyFargateClusterArn}",
+                  "TaskDefinition": "${MyFargateTaskArn}",
+                  "NetworkConfiguration": {
+                    "AwsvpcConfiguration": {
+                      "Subnets": [
+                        ${Subnets}
+                      ],
+                      "AssignPublicIp": "ENABLED"
+                    }
+                  }
+                },
+                "End": true
+              }
+            }
+          }
+        - MyFargateClusterArn: !GetAtt MyFargateCluster.Arn
+          MyFargateTaskArn: !Ref MyFargateTask
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "scheduler.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "EventBridgeToStepFunctionsPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                Resource: !Ref MyStateMachine
+
+  MyScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: cron(0 4 * * ? *)
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref MyStateMachine
+        RoleArn: !GetAtt EventBridgeRole.Arn

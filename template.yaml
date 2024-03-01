@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  DbName:
+    Description: "DB name for aurora"
+    Type: String
+    Default: HymaiaDB
+
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: "hymaia-datalake"
+
+  MyCluster:
+    Type: "AWS::RDS::DBCluster"
+    Properties:
+      Engine: aurora-mysql
+      DatabaseName: !Sub DbName
+      MasterUsername: masteruser
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !Ref KMSKey
+
+  MyInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBClusterIdentifier: !Ref MyCluster
+      DBInstanceClass: db.r5.large
+      Engine: aurora-mysql
+
+  KMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: Manual test KMS key
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Ref "AWS::StackName"
+        Statement:
+          - Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                Fn::Sub: 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - "kms:*"
+            Resource: "*"
+
+Outputs:
+  AuroraSecret:
+    Value: !GetAtt MyCluster.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraSecret'
+  AuroraPort:
+    Value: !GetAtt MyCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraPort'
+  AuroraHost:
+    Value: !GetAtt MyCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraHost'
+  AuroraKmsSecretArn:
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraKmsSecretArn'
+  BucketName:
+    Value: !Ref MyBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+  BucketArn:
+    Value: !GetAtt MyBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+

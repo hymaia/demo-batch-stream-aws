@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Exemple d'application SAM pour écrire dans DynamoDB et Firehose avec un trigger Kinesis
+
+Parameters:
+  Subnets:
+    Description: "subnets for fargate service"
+    Type: List<String>
+    Default: "subnet-01b63ea8d55565383,subnet-0b77b5786c4257dcb"
+  SecurityGroups:
+    Description: "security groups for fargate service"
+    Type: List<String>
+    Default: "sg-0d493c5d04236634d"
+
+Resources:
+  MyKinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  MyDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: MyTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+
+  MyFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: StreamingDemo
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !ImportValue formation-data-eng-BucketArn
+        RoleARN: !GetAtt FirehoseToS3Role.Arn
+        Prefix: 'data/!{timestamp:yyyy/MM/dd}/'
+        ErrorOutputPrefix: 'error/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd}/'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 300
+        CompressionFormat: UNCOMPRESSED
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: "/aws/kinesisfirehose/myfirehosestream"
+          LogStreamName: "S3Delivery"
+
+  FirehoseToS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseToS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:*
+                Resource: !Join
+                  - ""
+                  - - !ImportValue formation-data-eng-BucketArn
+                    - "/*"
+              - Effect: Allow
+                Action: s3:*
+                Resource: !ImportValue formation-data-eng-BucketArn
+              - Effect: "Allow"
+                Action:
+                  - "logs:PutLogEvents"
+                  - "logs:CreateLogStream"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/myfirehosestream:*"
+
+  MyLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src
+      Handler: consumer.lambda_handler
+      Runtime: python3.10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MyDynamoDBTable
+          FIREHOSE_NAME: !Ref MyFirehoseDeliveryStream
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt MyKinesisDataStream.Arn
+            BatchSize: 100
+            StartingPosition: LATEST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MyDynamoDBTable
+        - AmazonKinesisFirehoseFullAccess
+
+  ProducerFargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonKinesisFullAccess
+
+  ProducerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: producer
+
+  ProducerFargate:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: Producer
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  ProducerFargateTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !GetAtt ProducerFargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProducerFargateTaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      Cpu: 0.25 vcpu
+      Memory: 1 GB
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: producer
+          Cpu: 256
+          Memory: 1024
+          Image: !Sub "${ProducerRepository.RepositoryUri}:latest"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/data-producer
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: DATA_STREAM
+              Value: !Ref MyKinesisDataStream
+
+  MyDataProducerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ProducerFargate
+      DesiredCount: 1
+      TaskDefinition: !Ref ProducerFargateTask
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref Subnets
+          SecurityGroups: !Ref SecurityGroups
+      ServiceName: MyDataProducerService
+
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/data-producer
+      RetentionInDays: 3
+
+Outputs:
+  MyKinesisDataStream:
+    Description: "ARN of the Kinesis Data Stream"
+    Value: !GetAtt MyKinesisDataStream.Arn
+
+  MyDynamoDBTable:
+    Description: "ARN of the DynamoDB table"
+    Value: !GetAtt MyDynamoDBTable.Arn
+
+  MyFirehoseDeliveryStream:
+    Description: "ARN of the Firehose Delivery Stream"
+    Value: !GetAtt MyFirehoseDeliveryStream.Arn

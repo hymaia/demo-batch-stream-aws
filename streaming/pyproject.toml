@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "streaming"
+version = "0.1.0"
+description = ""
+authors = ["franck cussac <franck.cussac@gmail.com>"]
+packages = [
+    { include = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+boto3 = "^1.34.51"
+
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.2.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+producer = "src.producer:main"
